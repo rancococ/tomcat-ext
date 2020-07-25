@@ -28,6 +28,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.TimeZone;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -51,6 +52,7 @@ import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.collections.SynchronizedStack;
+import org.apache.tomcat.util.net.IPv6Utils;
 
 
 /**
@@ -179,6 +181,11 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
      * enabled this component
      */
     protected boolean enabled = true;
+
+     /**
+     * Use IPv6 canonical representation format as defined by RFC 5952.
+     */
+    private boolean ipv6Canonical = false;
 
     /**
      * The pattern used to format our access log lines.
@@ -351,7 +358,7 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
         private final Locale cacheDefaultLocale;
         private final DateFormatCache parent;
         protected final Cache cLFCache;
-        private final HashMap<String, Cache> formatCache = new HashMap<>();
+        private final Map<String, Cache> formatCache = new HashMap<>();
 
         protected DateFormatCache(int size, Locale loc, DateFormatCache parent) {
             cacheSize = size;
@@ -468,7 +475,13 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
     protected AccessLogElement[] logElements = null;
 
     /**
-     * Should this valve set request attributes for IP address, hostname,
+     * Array of elements where the value needs to be cached at the start of the
+     * request.
+     */
+    protected CachedElement[] cachedElements = null;
+
+    /**
+     * Should this valve use request attributes for IP address, hostname,
      * protocol and port used for the request.
      * Default is <code>false</code>.
      * @see #setRequestAttributesEnabled(boolean)
@@ -508,6 +521,16 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
     }
 
 
+    public boolean getIpv6Canonical() {
+        return ipv6Canonical;
+    }
+
+
+    public void setIpv6Canonical(boolean ipv6Canonical) {
+        this.ipv6Canonical = ipv6Canonical;
+    }
+
+
     /**
      * {@inheritDoc}
      * Default is <code>false</code>.
@@ -516,6 +539,7 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
     public void setRequestAttributesEnabled(boolean requestAttributesEnabled) {
         this.requestAttributesEnabled = requestAttributesEnabled;
     }
+
 
     /**
      * {@inheritDoc}
@@ -544,7 +568,7 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
      * @return the format pattern.
      */
     public String getPattern() {
-        return (this.pattern);
+        return this.pattern;
     }
 
 
@@ -564,6 +588,7 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
             this.pattern = pattern;
         }
         logElements = createLogElements();
+        cachedElements = createCachedElements(logElements);
     }
 
     /**
@@ -744,6 +769,11 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
             // to be cached in the request.
             request.getAttribute(Globals.CERTIFICATES_ATTR);
         }
+        if (cachedElements != null) {
+            for (CachedElement element : cachedElements) {
+                element.cache(request);
+            }
+        }
         getNext().invoke(request, response);
     }
 
@@ -776,8 +806,8 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
             result = new CharArrayWriter(128);
         }
 
-        for (int i = 0; i < logElements.length; i++) {
-            logElements[i].addElement(result, date, request, response, time);
+        for (AccessLogElement logElement : logElements) {
+            logElement.addElement(result, date, request, response, time);
         }
 
         log(result);
@@ -828,7 +858,7 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
         } else {
             for (Locale l: Locale.getAvailableLocales()) {
                 if (name.equals(l.toString())) {
-                    return(l);
+                    return l;
                 }
             }
         }
@@ -870,7 +900,20 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
     protected interface AccessLogElement {
         public void addElement(CharArrayWriter buf, Date date, Request request,
                 Response response, long time);
+    }
 
+    /**
+     * Marks an AccessLogElement as needing to be have the value cached at the
+     * start of the request rather than just recorded at the end as the source
+     * data for the element may not be available at the end of the request. This
+     * typically occurs for remote network information, such as ports, IP
+     * addresses etc. when the connection is closed unexpectedly. These elements
+     * take advantage of these values being cached elsewhere on first request
+     * and do not cache the value in the element since the elements are
+     * state-less.
+     */
+    protected interface CachedElement {
+        public void cache(Request request);
     }
 
     /**
@@ -894,9 +937,9 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
      */
     protected static class LocalAddrElement implements AccessLogElement {
 
-        private static final String LOCAL_ADDR_VALUE;
+        private final String localAddrValue;
 
-        static {
+        public LocalAddrElement(boolean ipv6Canonical) {
             String init;
             try {
                 init = InetAddress.getLocalHost().getHostAddress();
@@ -904,32 +947,50 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
                 ExceptionUtils.handleThrowable(e);
                 init = "127.0.0.1";
             }
-            LOCAL_ADDR_VALUE = init;
+
+            if (ipv6Canonical) {
+                localAddrValue = IPv6Utils.canonize(init);
+            } else {
+                localAddrValue = init;
+            }
         }
 
         @Override
         public void addElement(CharArrayWriter buf, Date date, Request request,
                 Response response, long time) {
-            buf.append(LOCAL_ADDR_VALUE);
+            buf.append(localAddrValue);
         }
     }
 
     /**
      * write remote IP address - %a
      */
-    protected class RemoteAddrElement implements AccessLogElement {
+    protected class RemoteAddrElement implements AccessLogElement, CachedElement {
         @Override
         public void addElement(CharArrayWriter buf, Date date, Request request,
                 Response response, long time) {
+            String value = null;
             if (requestAttributesEnabled) {
                 Object addr = request.getAttribute(REMOTE_ADDR_ATTRIBUTE);
                 if (addr == null) {
-                    buf.append(request.getRemoteAddr());
+                    value = request.getRemoteAddr();
                 } else {
-                    buf.append(addr.toString());
+                    value = addr.toString();
                 }
             } else {
-                buf.append(request.getRemoteAddr());
+                value = request.getRemoteAddr();
+            }
+
+            if (ipv6Canonical) {
+                value = IPv6Utils.canonize(value);
+            }
+            buf.append(value);
+        }
+
+        @Override
+        public void cache(Request request) {
+            if (!requestAttributesEnabled) {
+                request.getRemoteAddr();
             }
         }
     }
@@ -937,7 +998,7 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
     /**
      * write remote host name - %h
      */
-    protected class HostElement implements AccessLogElement {
+    protected class HostElement implements AccessLogElement, CachedElement {
         @Override
         public void addElement(CharArrayWriter buf, Date date, Request request,
                 Response response, long time) {
@@ -954,7 +1015,18 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
             if (value == null || value.length() == 0) {
                 value = "-";
             }
+
+            if (ipv6Canonical) {
+                value = IPv6Utils.canonize(value);
+            }
             buf.append(value);
+        }
+
+        @Override
+        public void cache(Request request) {
+            if (!requestAttributesEnabled) {
+                request.getRemoteHost();
+            }
         }
     }
 
@@ -1137,17 +1209,22 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
             if (usesBegin) {
                 timestamp -= time;
             }
-            switch (type) {
-            case CLF:
+            /*  Implementation note: This is deliberately not implemented using
+             *  switch. If a switch is used the compiler (at least the Oracle
+             *  one) will use a synthetic class to implement the switch. The
+             *  problem is that this class needs to be pre-loaded when using a
+             *  SecurityManager and the name of that class will depend on any
+             *  anonymous inner classes and any other synthetic classes. As such
+             *  the name is not constant and keeping the pre-loading up to date
+             *  as the name changes is error prone.
+             */
+            if (type == FormatType.CLF) {
                 buf.append(localDateCache.get().getFormat(timestamp));
-                break;
-            case SEC:
+            } else if (type == FormatType.SEC) {
                 buf.append(Long.toString(timestamp / 1000));
-                break;
-            case MSEC:
+            } else if (type == FormatType.MSEC) {
                 buf.append(Long.toString(timestamp));
-                break;
-            case MSEC_FRAC:
+            } else if (type == FormatType.MSEC_FRAC) {
                 frac = timestamp % 1000;
                 if (frac < 100) {
                     if (frac < 10) {
@@ -1158,8 +1235,8 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
                     }
                 }
                 buf.append(Long.toString(frac));
-                break;
-            case SDF:
+            } else {
+                // FormatType.SDF
                 String temp = localDateCache.get().getFormat(format, locale, timestamp);
                 if (usesMsecs) {
                     frac = timestamp % 1000;
@@ -1177,7 +1254,6 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
                     temp = temp.replace(msecPattern, Long.toString(frac));
                 }
                 buf.append(temp);
-                break;
             }
         }
     }
@@ -1237,7 +1313,7 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
     /**
      * write local or remote port for request connection - %p and %{xxx}p
      */
-    protected class PortElement implements AccessLogElement {
+    protected class PortElement implements AccessLogElement, CachedElement {
 
         /**
          * Type of port to log
@@ -1282,6 +1358,13 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
                 } else {
                     buf.append(Integer.toString(request.getRemotePort()));
                 }
+            }
+        }
+
+        @Override
+        public void cache(Request request) {
+            if (portType == PortType.REMOTE) {
+                request.getRemotePort();
             }
         }
     }
@@ -1444,11 +1527,28 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
     /**
      * write local server name - %v
      */
-    protected static class LocalServerNameElement implements AccessLogElement {
+    protected class LocalServerNameElement implements AccessLogElement {
         @Override
         public void addElement(CharArrayWriter buf, Date date, Request request,
                 Response response, long time) {
-            buf.append(request.getServerName());
+            String value = null;
+            if (requestAttributesEnabled) {
+                Object serverName = request.getAttribute(SERVER_NAME_ATTRIBUTE);
+                if (serverName != null) {
+                    value = serverName.toString();
+                }
+            }
+            if (value == null || value.length() == 0) {
+                value = request.getServerName();
+            }
+            if (value == null || value.length() == 0) {
+                value = "-";
+            }
+
+            if (ipv6Canonical) {
+                value = IPv6Utils.canonize(value);
+            }
+            buf.append(value);
         }
     }
 
@@ -1508,11 +1608,11 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
         public void addElement(CharArrayWriter buf, Date date, Request request,
                 Response response, long time) {
             String value = "-";
-            Cookie[] c = request.getCookies();
-            if (c != null) {
-                for (int i = 0; i < c.length; i++) {
-                    if (header.equals(c[i].getName())) {
-                        value = c[i].getValue();
+            Cookie[] cookies = request.getCookies();
+            if (cookies != null) {
+                for (Cookie cookie : cookies) {
+                    if (header.equals(cookie.getName())) {
+                        value = cookie.getValue();
                         break;
                     }
                 }
@@ -1705,6 +1805,18 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
         return list.toArray(new AccessLogElement[0]);
     }
 
+
+    private CachedElement[] createCachedElements(AccessLogElement[] elements) {
+        List<CachedElement> list = new ArrayList<>();
+        for (AccessLogElement element : elements) {
+            if (element instanceof CachedElement) {
+                list.add((CachedElement) element);
+            }
+        }
+        return list.toArray(new CachedElement[0]);
+    }
+
+
     /**
      * Create an AccessLogElement implementation which needs an element name.
      * @param name Header name
@@ -1745,7 +1857,7 @@ public abstract class AbstractAccessLogValveWithParameter extends ValveBase impl
         case 'a':
             return new RemoteAddrElement();
         case 'A':
-            return new LocalAddrElement();
+            return new LocalAddrElement(ipv6Canonical);
         case 'b':
             return new ByteSentElement(true);
         case 'B':

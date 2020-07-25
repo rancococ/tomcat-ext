@@ -180,7 +180,7 @@ public class AccessLogValveWithParameter extends AbstractAccessLogValveWithParam
      * @return the directory in which we create log files.
      */
     public String getDirectory() {
-        return (directory);
+        return directory;
     }
 
 
@@ -220,7 +220,7 @@ public class AccessLogValveWithParameter extends AbstractAccessLogValveWithParam
      * @return the log file prefix.
      */
     public String getPrefix() {
-        return (prefix);
+        return prefix;
     }
 
 
@@ -299,7 +299,7 @@ public class AccessLogValveWithParameter extends AbstractAccessLogValveWithParam
      * @return the log file suffix.
      */
     public String getSuffix() {
-        return (suffix);
+        return suffix;
     }
 
 
@@ -610,10 +610,10 @@ public class AccessLogValveWithParameter extends AbstractAccessLogValveWithParam
 
         // Log this message
         try {
+            message.write(System.lineSeparator());
             synchronized(this) {
                 if (writer != null) {
                     message.writeTo(writer);
-                    writer.println("");
                     if (!buffered) {
                         writer.flush();
                     }
